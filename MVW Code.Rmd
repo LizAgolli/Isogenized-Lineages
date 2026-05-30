@@ -1,0 +1,300 @@
+---
+title: "MVW"
+author: "Elizabeth Chen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#loading packages that will be used
+#detach("package:plyr", unload = TRUE)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(beepr)
+library(ggthemes)
+library(stringr)
+library(splitstackshape)
+library(MASS)
+library(investr)#ED50 calculator
+
+char_mvw <- read.csv('~/Documents/SSD_Data/MVWall.CSV')
+```
+
+1. PREPARE DATA FRAME
+
+starting data frame
+ID Pupated(Y/N) Eclosed(Y/N) Sex(M/F/UNKNOWN)
+
+```{r adjusting data frame}
+char_mvw$line <- as.factor(substr(char_mvw$id, 1, 1))
+char_mvw$day <- as.factor(substr(char_mvw$id, 6, 6))
+char_mvw$mass <- as.numeric(substr(char_mvw$id, 8, 11))
+col_order <- c("id", "line", "day", "mass", "pupated", "eclosed", "sex") #order I want
+char_mvw <- char_mvw[, col_order] #applying that order
+char_mvw <- char_mvw %>%
+  filter(across(everything(), ~ !is.na(.) & str_trim(.) != ""))
+char_mvw
+```
+
+final data frame
+ID Line Day Mass Pupated(1/0) Eclosed(1/0) Sex
+
+Analyze with all unknown as members of both sexes: remove all females for a male char_mvw and analysis and then vice versa
+```{r making all male and all female data frames}
+char_mvw_F <- char_mvw %>% filter(sex!="Male") #filtering out males
+char_mvw_M <- char_mvw %>% filter(sex!="Female") #filtering out females
+
+char_mvw_F$sex <- "Female" #turning unknown female
+char_mvw_M$sex <- "Male" #turning unknown male
+
+#recombine data
+char_mvw2 <- dplyr::bind_rows(char_mvw_F, char_mvw_M)
+char_mvw2
+```
+
+2. FIT MODEL
+```{r fitting models for all}
+# Fit the logistic regression model
+eclosed_model <- glm(eclosed ~ mass * sex * line, data = char_mvw2, family = binomial)
+summary(eclosed_model)
+pupated_model <- glm(pupated ~ mass * sex * line, data = char_mvw2, family = binomial)
+
+
+# Apply to all combinations
+#results <- do.call(rbind, Map(get_ed50, combinations$factor1, combinations$factor2))
+#print(results)
+
+# Summary of the model
+summary(eclosed_model)
+summary(pupated_model)
+
+FH50 <- dose.p(glm(eclosed ~ mass, data = char_mvw2[char_mvw2$sex == "Female" & char_mvw2$line == "H", ], family = binomial), p = 0.5)[[1]]
+MH50 <- dose.p(glm(eclosed ~ mass, data = char_mvw2[char_mvw2$sex == "Male" & char_mvw2$line == "H", ], family = binomial), p = 0.5)[[1]]
+FL50 <- dose.p(glm(eclosed ~ mass, data = char_mvw2[char_mvw2$sex == "Female" & char_mvw2$line == "L", ], family = binomial), p = 0.5)[[1]]
+ML50 <- dose.p(glm(eclosed ~ mass, data = char_mvw2[char_mvw2$sex == "Male" & char_mvw2$line == "L", ], family = binomial), p = 0.5)[[1]]
+real50 <- data.frame(group = c("FH", "MH", "FL", "ML"),
+                     mvw50 = c(FH50, MH50, FL50, ML50))
+real50
+
+ggplot(char_mvw, aes(x = mass)) +
+  geom_histogram(aes(y = ..density..), 
+                 bins = 40, 
+                 fill = "lightblue", 
+                 color = "black") +
+  geom_density(color = "blue") +
+  facet_grid(line ~ sex)
+```
+
+
+3. PLOT LOGISTIC CURVE
+```{r plotting}
+ggplot(char_mvw2, aes(x = mass, y = eclosed, color = sex, shape = sex, linetype = line)) +
+  geom_point(alpha=0.25, size=1.5) +
+  geom_hline(yintercept = 0.5, linetype = 3) +
+  stat_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE) +
+  labs(title = "Logistic Regression: Mass vs. Adulthood",
+       x = "Mass",
+       y = "Probability of Reaching Adulthood") +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 2610)) +
+  theme_minimal()
+
+ggplot(char_mvw2, aes(x = mass, y = pupated, color = sex, shape = sex, linetype = line)) +
+  geom_point(alpha=0.25, size=1.5) +
+  geom_hline(yintercept = 0.5, linetype = 3) +
+  stat_smooth(method = "glm", method.args = list(family = "binomial"), se = FALSE) +
+  labs(title = "Logistic Regression: Mass vs. Pupation",
+       x = "Mass",
+       y = "Probability of Pupating") +
+  scale_x_continuous(expand = c(0, 0), limits = c(0, 2610)) +
+  theme_minimal()
+```
+```{r}
+counts <- aggregate(n ~ line + sex, 
+                   data = transform(char_mvw[char_mvw$sex %in% c("Male", "Female"), ], 
+                   n = 1), 
+                   FUN = length)
+
+inv_probs <- do.call(rbind, lapply(split(counts, counts$line), function(x) {
+  data.frame(
+    line = unique(x$line),
+    female_prob = x$n[x$sex == "Male"] / sum(x$n), #male adult prob = female unknown prob
+    male_prob = x$n[x$sex == "Female"] / sum(x$n) #female adult prob = male unknown prob
+  )
+}))
+
+char_mvw <- char_mvw %>% 
+  left_join(inv_probs, by = "line")
+char_mvw <- char_mvw[, !colnames(char_mvw) %in% c("inverse_ratio", "inverse_FM_adult")]
+char_mvw
+```
+
+```{r}
+boot50 <- data.frame(FH = numeric(0), MH = numeric(0), FL = numeric(0), ML = numeric(0), FC = numeric(0), MC = numeric(0))  #empty data frame and columns
+curve_storage <- list()
+mass_grid <- seq(0, max(char_mvw$mass), length.out = 1000)
+set.seed(123)
+
+for (i in 1:1000) { #loop :x #of times
+  samp <- stratified(char_mvw, c("line", "sex"), 0.9999999, replace = TRUE) #resample individual sizes
+  unknown_mask <- samp$sex == "Unknown"
+  samp$sex[unknown_mask] <- sapply(samp$line[unknown_mask], function(l) { #resampling 
+    probs <- inv_probs[inv_probs$line == l, c("female_prob", "male_prob")]
+    sample(c("Female", "Male"), 1, prob = probs)})
+  #pulling dose50 valueshead
+  FH50 <- dose.p(glm(eclosed ~ mass, data = samp[samp$sex == "Female" & samp$line == "H", ], family = binomial), p = 0.5)[[1]]
+  MH50 <- dose.p(glm(eclosed ~ mass, data = samp[samp$sex == "Male" & samp$line == "H", ], family = binomial), p = 0.5)[[1]]
+  FL50 <- dose.p(glm(eclosed ~ mass, data = samp[samp$sex == "Female" & samp$line == "L", ], family = binomial), p = 0.5)[[1]]
+  ML50 <- dose.p(glm(eclosed ~ mass, data = samp[samp$sex == "Male" & samp$line == "L", ], family = binomial), p = 0.5)[[1]]
+  FC50 <- dose.p(glm(eclosed ~ mass, data = samp[samp$sex == "Female" & samp$line == "C", ], family = binomial), p = 0.5)[[1]]
+  MC50 <- dose.p(glm(eclosed ~ mass, data = samp[samp$sex == "Male" & samp$line == "C", ], family = binomial), p = 0.5)[[1]]
+  boot50 <- rbind(boot50, data.frame(FH = FH50, MH = MH50, FL = FL50, ML = ML50, FC = FC50, MC = MC50)) #storing values
+  samp_model <- glm(eclosed ~ mass * sex * line, data = samp, family = binomial)
+  pred_grid <- expand.grid(
+    mass = mass_grid,
+    sex = c("Female", "Male"),
+    line = c("H", "L", "C")
+  )
+  pred_grid$prob <- predict(samp_model, newdata = pred_grid, type = "response")
+  pred_grid$bootstrap_iter <- i
+  curve_storage[[i]] <- pred_grid
+}
+
+apply(boot50, 2, quantile, probs = c(0.025, 0.5, 0.975))
+all_curves <- do.call(rbind, curve_storage)
+
+beep(5)
+
+
+```
+
+``` {r comparisons}
+boot50$FCMC <- (boot50$FC - boot50$MC)
+boot50$FHMH <- (boot50$FH - boot50$MH)
+boot50$FLML <- (boot50$FL - boot50$ML)
+
+boot50$FCFH <- (boot50$FC - boot50$FH)
+boot50$FCFL <- (boot50$FC - boot50$FL)
+boot50$FLFH <- (boot50$FL - boot50$FH)
+
+boot50$MCMH <- (boot50$MC - boot50$MH)
+boot50$MCML <- (boot50$MC - boot50$ML)
+boot50$MLMH <- (boot50$ML - boot50$MH)
+
+test <- boot50[, -c(1:6)]
+
+# Calculate quantiles
+bonferroni_correction <- 0.05/9
+new_probs <- c(bonferroni_correction/2, 1-(bonferroni_correction/2))
+
+quantiles <- apply(test, 2, quantile, probs = new_probs)
+
+# Identify columns where 95% CI does not encompass 0
+significant_cols <- sapply(1:ncol(quantiles), function(i) {
+  lower <- quantiles[1, i]
+  upper <- quantiles[2, i]
+  # Check if both quantiles are positive OR both are negative
+  (lower > 0 & upper > 0) | (lower < 0 & upper < 0)
+})
+
+# Get names of significant columns
+significant_names <- colnames(quantiles)[significant_cols]
+
+# Print results
+cat("Columns where CI does not encompass 0:\n")
+print(significant_names)
+```
+
+```{r plot boot}
+distFH<- ggplot(boot50, aes(x = FH)) +
+  geom_histogram() +
+  labs(x = "MVW", y = "Count", title = "Histogram of FH")
+
+distMH<- ggplot(boot50, aes(x = MH)) +
+  geom_histogram() +
+  labs(x = "MVW", y = "Count", title = "Histogram of MH")
+
+distFL<- ggplot(boot50, aes(x = FL)) +
+  geom_histogram() +
+  labs(x = "MVW", y = "Count", title = "Histogram of FL")
+
+distML<- ggplot(boot50, aes(x = ML)) +
+  geom_histogram() +
+  labs(x = "MVW", y = "Count", title = "Histogram of ML")
+
+distFH
+distMH
+distFL
+distML
+
+ggplot(all_curves, aes(x = mass, y = prob, group = interaction(sex, line, bootstrap_iter))) +
+  geom_line(aes(color = interaction(sex, line)), alpha = 0.05) +
+  scale_color_manual(values = c("Female.H" = "red", "Male.H" = "blue",
+                               "Female.L" = "pink", "Male.L" = "lightblue")) +
+  labs(title = "All Bootstrap Replicates", x = "Mass", y = "Probability") +
+  theme_minimal()
+```
+
+```{r}
+#detach("package:plyr", unload = TRUE)
+quant_curves <- all_curves %>%
+  group_by(mass, sex, line) %>%
+  summarize(lower = quantile(prob, probs = 0.025), 
+            mean = quantile(prob, probs = 0.5),
+            upper = quantile(prob, probs = 0.975),
+  .groups = "drop")
+```
+
+```{r}
+ggplot(quant_curves, aes(x = mass, 
+                          color = paste(sex, line), 
+                          fill = paste(sex, line))) +
+  geom_line(aes(y = mean)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.33, color = NA) +
+  labs(x = "Mass", y = "Probability", color = "Group", fill = "Group") +
+    scale_fill_manual(values = c(
+    "Female H" = "pink",  # Red-pink
+    "Male H" = "lightblue",  # Teal
+    "Female L" = "hotpink",  # Pink
+    "Male L" = "blue"   # Blue
+  )) +
+  geom_hline(yintercept = 0.5, linetype = 3) +
+  theme_minimal()
+```
+
+```{r}
+plot50 <- ggplot(boot50, aes(x = group, y = mean, fill = group)) +
+  geom_col(width = 0.7) +  # Bars
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.2,          # Width of error bar caps
+    linewidth = 0.8,      # Thickness of error bars
+    color = "black"
+  ) +
+  # Color scheme (pink for females, blue for males)
+  scale_fill_manual(values = c(
+    "FH" = "pink",  # Red-pink
+    "MH" = "lightblue",  # Teal
+    "FL" = "hotpink",  # Pink
+    "ML" = "blue"   # Blue
+  )) +
+  labs(
+    title = "MVW with 95% Confidence Intervals",
+    x = "Sex and Line",
+    y = "Larval Mass"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+plot50
+
+#bonferoni correction number of comparisons  5%/#number of comparisons 
+```
+
+#95% CI parameter values
+#95% of each x point to make curves 
